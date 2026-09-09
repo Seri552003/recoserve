@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: recoserve
+      POSTGRES_PASSWORD: recoserve
+      POSTGRES_DB: recoserve
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  serving-api:
+    build: ./serving-api
+    ports:
+      - "4000:4000"
+    environment:
+      DATABASE_URL: postgres://recoserve:recoserve@postgres:5432/recoserve
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  pgdata:
