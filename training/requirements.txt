@@ -1,3 +1,4 @@
+numpy<2
 pandas==2.2.2
 scikit-surprise==1.1.4
 psycopg2-binary==2.9.9
