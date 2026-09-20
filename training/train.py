@@ -1,13 +1,21 @@
 """
 RecoServe training pipeline.
 
-Loads MovieLens ratings, trains a collaborative-filtering model (SVD),
-generates top-N recommendations per user, computes a popularity-based
-cold-start fallback list, and writes both to Postgres for the serving
-API to read.
+Loads MovieLens-format ratings/movies, loads them into Postgres, trains
+a collaborative-filtering model (SVD), generates top-N recommendations
+per user, computes a popularity-based cold-start fallback list, and
+writes both to Postgres for the serving API to read.
 
 Run on a schedule (cron / GitHub Actions) - never called from the
 request path. The serving API only ever reads what this script writes.
+
+For local development/testing without the real dataset:
+    python generate_sample_data.py
+    python train.py
+
+For production, download the real dataset from
+https://grouplens.org/datasets/movielens/ (the 25M version) and place
+movies.csv / ratings.csv in data/ before running this script.
 """
 
 import os
@@ -19,15 +27,52 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL = os.environ["DATABASE_URL"]
-TOP_N = 10
+TOP_N = int(os.environ.get("TOP_N", 10))
+# How many ratings a movie needs before it's eligible for the
+# popularity fallback list - avoids a movie with one 5-star rating
+# outranking genuinely well-established titles. Lower this for small
+# local/sample datasets via the env var; the real MovieLens dataset
+# comfortably clears the default of 50.
+POPULARITY_MIN_RATINGS = int(os.environ.get("POPULARITY_MIN_RATINGS", 50))
 
 engine = create_engine(DATABASE_URL)
 
 
-def load_ratings():
-    # Expects ratings.csv (userId, movieId, rating, timestamp) from
-    # https://grouplens.org/datasets/movielens/
-    return pd.read_csv("data/ratings.csv")
+def load_data():
+    movies_df = pd.read_csv("data/movies.csv")
+    ratings_df = pd.read_csv("data/ratings.csv")
+    return movies_df, ratings_df
+
+
+def load_reference_data_into_db(movies_df, ratings_df):
+    """Loads movies and ratings into Postgres. Movies are upserted
+    (idempotent across repeated runs); ratings are only inserted if the
+    table is currently empty, since in production ratings would arrive
+    continuously from the application rather than being reloaded from
+    a CSV on every training run."""
+    with engine.begin() as conn:
+        for _, row in movies_df.iterrows():
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO movies (id, title, genres) VALUES (:id, :title, :genres)
+                    ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, genres = EXCLUDED.genres
+                    """
+                ),
+                {"id": int(row.movieId), "title": row.title, "genres": row.genres},
+            )
+
+        existing = conn.execute(text("SELECT COUNT(*) FROM ratings")).scalar()
+        if existing == 0:
+            conn.execute(
+                text(
+                    "INSERT INTO ratings (user_id, movie_id, rating) VALUES (:user_id, :movie_id, :rating)"
+                ),
+                [
+                    {"user_id": int(r.userId), "movie_id": int(r.movieId), "rating": float(r.rating)}
+                    for r in ratings_df.itertuples()
+                ],
+            )
 
 
 def train_model(ratings_df):
@@ -40,7 +85,7 @@ def train_model(ratings_df):
     return model, trainset
 
 
-def generate_top_n(model, trainset, ratings_df, n=TOP_N):
+def generate_top_n(model, ratings_df, n=TOP_N):
     """For every user, predict a score for every movie they haven't
     rated yet, and keep the top N."""
     all_movie_ids = ratings_df["movieId"].unique()
@@ -61,8 +106,15 @@ def compute_popularity_fallback(ratings_df, n=TOP_N):
     """Cold-start list for users with little/no history: highest
     average rating among movies with a reasonable number of ratings."""
     stats = ratings_df.groupby("movieId")["rating"].agg(["mean", "count"])
-    stats = stats[stats["count"] >= 50]  # avoid movies with 1-2 five-star ratings
-    top = stats.sort_values("mean", ascending=False).head(n)
+    eligible = stats[stats["count"] >= POPULARITY_MIN_RATINGS]
+
+    if eligible.empty:
+        # Sample/small datasets may not have any movie clearing the
+        # threshold - fall back to whatever has the most ratings at all
+        # rather than returning an empty list.
+        eligible = stats.sort_values("count", ascending=False).head(max(n * 2, 20))
+
+    top = eligible.sort_values("mean", ascending=False).head(n)
     return list(top.index)
 
 
@@ -90,14 +142,17 @@ def write_recommendations(recommendations, popularity_fallback):
 
 
 def main():
-    print("Loading ratings...")
-    ratings_df = load_ratings()
+    print("Loading movies and ratings...")
+    movies_df, ratings_df = load_data()
+
+    print("Loading reference data into Postgres...")
+    load_reference_data_into_db(movies_df, ratings_df)
 
     print("Training SVD model...")
-    model, trainset = train_model(ratings_df)
+    model, _trainset = train_model(ratings_df)
 
     print("Generating top-N recommendations per user...")
-    recommendations = generate_top_n(model, trainset, ratings_df)
+    recommendations = generate_top_n(model, ratings_df)
 
     print("Computing popularity fallback for cold-start users...")
     popularity_fallback = compute_popularity_fallback(ratings_df)
